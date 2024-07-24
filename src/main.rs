@@ -1,0 +1,93 @@
+#![no_std]
+#![no_main]
+
+// pick a panicking behavior
+use defmt_rtt as _;
+use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch panics
+// use panic_abort as _; // requires nightly
+// use panic_itm as _; // logs messages over ITM; requires ITM support
+// use panic_semihosting as _; // logs messages to the host stderr; requires a debugger
+
+use cortex_m::asm;
+use cortex_m_rt::entry;
+use cortex_m_semihosting::hprintln;
+
+use stm32f3xx_hal::{
+    adc, adc::Adc,
+    pac::{self, interrupt},
+    prelude::*,
+    timer,
+};
+
+use core::cell::RefCell;
+
+use critical_section::Mutex;
+
+static TIMER: Mutex<RefCell<Option<timer::Timer<pac::TIM2>>>> = Mutex::new(RefCell::new(None));
+
+#[entry]
+fn main() -> ! {
+    hprintln!("Hello, World");
+    // standard setup
+    let dp = pac::Peripherals::take().unwrap();
+    //
+    let mut rcc = dp.RCC.constrain();
+    let mut clocks = rcc
+        .cfgr
+        .freeze(&mut dp.FLASH.constrain().acr);
+    //fix some bug shit
+    dp.DBGMCU.cr.modify(|_, w| {
+        w.dbg_sleep().set_bit();
+        w.dbg_standby().set_bit();
+        w.dbg_stop().set_bit()
+    });
+    //
+    // //adc
+    //
+    let adcs = (dp.ADC1, dp.ADC2);
+    let common_adc = adc::CommonAdc::new(dp.ADC1_2, &clocks, &mut rcc.ahb);
+    let mut adc = Adc::new(adcs.0, adc::config::Config::default(), &clocks, &common_adc).into_oneshot();
+    //
+    // input
+    let mut gpioa = dp.GPIOA.split(&mut rcc.ahb);
+    let mut analog_pin = gpioa.pa0.into_analog(&mut gpioa.moder, &mut gpioa.pupdr);
+    let mut timer = timer::Timer::new(dp.TIM2, clocks, &mut rcc.apb1);
+
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(timer.interrupt());
+    }
+    timer.enable_interrupt(timer::Event::Update);
+    // Start a timer which fires regularly to wake up from `asm::wfi`
+    timer.start(500.milliseconds());
+    // Put the timer in the global context.
+    critical_section::with(|cs| {
+        TIMER.borrow(cs).replace(Some(timer));
+    });
+
+    hprintln!("Finished setup. now entering loop");
+    loop {
+        // let adc_data: u16 = adc.read(&mut analog_pin).unwrap();
+        // defmt::trace!("PA0 reads {}", adc_data);
+        // hprintln!("{}", adc_data);
+        asm::wfi();
+        asm::delay(8_000_000);
+    }
+}
+
+#[interrupt]
+fn TIM2() {
+    // Just handle the pending interrupt event.
+    critical_section::with(|cs| {
+        TIMER
+            // Unlock resource for use in critical section
+            .borrow(cs)
+            // Get a mutable reference from the RefCell
+            .borrow_mut()
+            // Make the inner Option<T> -> Option<&mut T>
+            .as_mut()
+            // Unwrap the option, we know, that it has Some()!
+            .unwrap()
+            // Finally operate on the timer itself.
+            .clear_event(timer::Event::Update);
+    })
+}
